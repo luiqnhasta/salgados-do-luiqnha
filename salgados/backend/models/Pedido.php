@@ -13,7 +13,6 @@ class Pedido {
     public $data_entrega;
     public $codigo_cliente;
     public $observacoes;
-    public $codigo_pedido;
 
     public function __construct($db) {
         $this->conn = $db;
@@ -52,7 +51,7 @@ class Pedido {
             $stmt->bindParam(":observacoes", $this->observacoes);
 
             if(!$stmt->execute()) {
-                throw new Exception("Erro ao criar pedido");
+                throw new Exception("Erro ao criar pedido: " . implode(", ", $stmt->errorInfo()));
             }
 
             $this->codigo = $this->conn->lastInsertId();
@@ -64,7 +63,7 @@ class Pedido {
                               VALUES (:codigo_pedido, :codigo_produto, :quantidade, :preco_unitario, :tipo_quantidade, :quantidade_unidades)";
 
                 $item_stmt = $this->conn->prepare($item_query);
-                $item_stmt->bindParam(":codigo_pedido", $this->codigo_pedido);
+                $item_stmt->bindParam(":codigo_pedido", $this->codigo);
                 $item_stmt->bindParam(":codigo_produto", $item['codigo_produto']);
                 $item_stmt->bindParam(":quantidade", $item['quantidade']);
                 $item_stmt->bindParam(":preco_unitario", $item['preco_unitario']);
@@ -72,7 +71,7 @@ class Pedido {
                 $item_stmt->bindParam(":quantidade_unidades", $item['quantidade_unidades']);
 
                 if(!$item_stmt->execute()) {
-                    throw new Exception("Erro ao inserir item do pedido");
+                    throw new Exception("Erro ao inserir item do pedido: " . implode(", ", $item_stmt->errorInfo()));
                 }
             }
 
@@ -82,7 +81,7 @@ class Pedido {
         } catch (Exception $e) {
             $this->conn->rollBack();
             error_log("Erro ao criar pedido: " . $e->getMessage());
-            return false;
+            throw $e;
         }
     }
 
@@ -103,9 +102,13 @@ class Pedido {
 
     // Ler pedidos por cliente
     function readByCliente($codigo_cliente) {
-        $query = "SELECT * FROM " . $this->table_name . " 
-                  WHERE codigo_cliente = :codigo_cliente 
-                  ORDER BY data_pedido DESC";
+        $query = "SELECT p.*, c.nome as nome_cliente, c.telefone as telefone_cliente,
+                         ci.nome as cidade_nome
+                  FROM " . $this->table_name . " p
+                  LEFT JOIN cliente c ON p.codigo_cliente = c.codigo
+                  LEFT JOIN cidade ci ON c.sigla_cidade = ci.sigla
+                  WHERE p.codigo_cliente = :codigo_cliente 
+                  ORDER BY p.data_pedido DESC";
 
         $stmt = $this->conn->prepare($query);
         $stmt->bindParam(":codigo_cliente", $codigo_cliente);
@@ -152,7 +155,7 @@ class Pedido {
     function getItens() {
         $query = "SELECT pp.*, pr.nome, pr.sabor, c.nome_categoria
                   FROM pedido_produto pp
-                  JOIN produto pr ON pp.codigo_pedido = pr.codigo
+                  JOIN produto pr ON pp.codigo_produto = pr.codigo
                   LEFT JOIN categoria c ON pr.codigo_categoria = c.codigo
                   WHERE pp.codigo_pedido = :codigo";
 
@@ -199,30 +202,65 @@ class Pedido {
 
     // Criar delivery se necessário
     function createDelivery($endereco_entrega, $sigla_cidade, $hora_delivery = null) {
-        $query = "INSERT INTO delivery (endereco, codigo_pedido, sigla_cidade, hora_delivery, codigo_preco) 
-                  VALUES (:endereco, :codigo_pedido, :sigla_cidade, :hora_delivery, 
-                         (SELECT codigo FROM preco_delivery WHERE valor = 10.00 LIMIT 1))";
+        try {
+            // Verificar se a tabela delivery existe e tem a estrutura correta
+            $check_query = "SELECT column_name FROM information_schema.columns 
+                           WHERE table_name = 'delivery' AND table_schema = DATABASE()";
+            $check_stmt = $this->conn->prepare($check_query);
+            $check_stmt->execute();
+            
+            if ($check_stmt->rowCount() === 0) {
+                // Tabela delivery não existe, apenas log o erro
+                error_log("Tabela delivery não encontrada");
+                return false;
+            }
 
-        $stmt = $this->conn->prepare($query);
-        $stmt->bindParam(":endereco", $endereco_entrega);
-        $stmt->bindParam(":codigo_pedido", $this->codigo_pedido);
-        $stmt->bindParam(":sigla_cidade", $sigla_cidade);
-        $stmt->bindParam(":hora_delivery", $hora_delivery);
+            // Buscar código do preço de delivery
+            $preco_query = "SELECT codigo FROM preco_delivery WHERE descricao = 'Taxa padrão de entrega' LIMIT 1";
+            $preco_stmt = $this->conn->prepare($preco_query);
+            $preco_stmt->execute();
+            
+            $codigo_preco = 1; // Valor padrão
+            if ($preco_stmt->rowCount() > 0) {
+                $preco_row = $preco_stmt->fetch(PDO::FETCH_ASSOC);
+                $codigo_preco = $preco_row['codigo'];
+            }
 
-        return $stmt->execute();
+            $query = "INSERT INTO delivery (endereco, codigo_pedido, sigla_cidade, hora_delivery, codigo_preco) 
+                      VALUES (:endereco, :codigo_pedido, :sigla_cidade, :hora_delivery, :codigo_preco)";
+
+            $stmt = $this->conn->prepare($query);
+            $stmt->bindParam(":endereco", $endereco_entrega);
+            $stmt->bindParam(":codigo_pedido", $this->codigo);
+            $stmt->bindParam(":sigla_cidade", $sigla_cidade);
+            $stmt->bindParam(":hora_delivery", $hora_delivery);
+            $stmt->bindParam(":codigo_preco", $codigo_preco);
+
+            return $stmt->execute();
+        } catch (Exception $e) {
+            error_log("Erro ao criar delivery: " . $e->getMessage());
+            return false;
+        }
     }
 
     // Gerar número do pedido
     private function generateOrderNumber() {
-        $query = "SELECT COUNT(*) as count FROM " . $this->table_name;
-        $stmt = $this->conn->prepare($query);
-        $stmt->execute();
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        $numeroPedido = $row['count'] + 1;
-        $data = date('dmY');
-        
-        return sprintf("#%03d-%s", $numeroPedido, $data);
+        try {
+            $query = "SELECT COUNT(*) as count FROM " . $this->table_name;
+            $stmt = $this->conn->prepare($query);
+            $stmt->execute();
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            $numeroPedido = ($row['count'] ?? 0) + 1;
+            $data = date('dmY');
+            
+            return sprintf("#%03d-%s", $numeroPedido, $data);
+        } catch (Exception $e) {
+            // Fallback para um número aleatório se houver erro
+            $numeroPedido = rand(1, 999);
+            $data = date('dmY');
+            return sprintf("#%03d-%s", $numeroPedido, $data);
+        }
     }
 }
 ?>

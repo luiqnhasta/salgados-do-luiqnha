@@ -373,7 +373,11 @@ async function finalizeOrder() {
     try {
         Utils.showMessage('Finalizando pedido...', 'info');
         
+        console.log('Enviando dados do pedido:', orderData);
+        
         const response = await ApiClient.post(API_CONFIG.endpoints.createOrder, orderData);
+        
+        console.log('Resposta da API:', response);
         
         if (response.sucesso) {
             // Limpar carrinho
